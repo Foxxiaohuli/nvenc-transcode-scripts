@@ -37,18 +37,18 @@ nvidia-smi
 
 ## 脚本说明
 
-所有脚本均接受一个必填参数 `-InputFile`，输出文件名为 `{原文件名}_hevc.mp4`。
+所有脚本均接受一个必填参数 `-InputFile`，输出文件名为 `{原文件名}_hevc.mp4`。编码参数统一为 p6 / VBR HQ / CQ 29 / 码率上限 2.4 Mbps / 音频直接复制。
 
-### GPU_dcuda.ps1
+### GPU_dcuda.ps1 — 推荐（全 GPU 管线，性能最佳）
 
-纯 GPU 管线，转码后通过 ExifTool 写入旋转元数据。
+**全程在 GPU 显存内完成，不解码到系统内存，没有 CPU 处理旋转的部分。** 解码（CUDA 格式）→ 缩放（scale_cuda）→ 编码（NVENC）三个阶段数据始终留在 GPU 上，是三个脚本中性能最佳、CPU 和内存占用最低的方案。
 
 | 项目 | 参数 |
 |------|------|
 | 管线 | GPU 解码 (CUDA) → GPU 缩放 → NVENC 编码 |
-| 分辨率 | 自动宽度 × 720p |
+| 分辨率 | 720p（自动对边） |
 | 帧率 | 30fps |
-| 编码预设 | p5 / VBR HQ / CQ 29 |
+| 编码预设 | p6 / VBR HQ / CQ 29 |
 | 码率上限 | 2.4 Mbps |
 | 音频 | 直接复制 |
 | 后处理 | ExifTool 写入 rotation=90 元数据 |
@@ -57,7 +57,9 @@ nvidia-smi
 .\GPU_dcuda.ps1 -InputFile ".\video.mp4"
 ```
 
-适用于竖屏拍摄的视频——不物理旋转像素，而是通过元数据标记方向，播放器自动旋转显示。
+使用 `-noautorotate` 禁止 FFmpeg 自动旋转，scale_cuda 直接按存储分辨率缩放（`-2:720`，720 对应存储时短边宽度），转码完成后通过 ExifTool 写入旋转元数据，播放器自动旋转显示。不物理旋转像素，而是通过元数据标记方向。
+
+相比之下，另外两个上传脚本都需要将视频帧输出到系统内存，在 CPU 上完成旋转后再上传回 GPU，额外的数据搬运带来显著的性能开销。
 
 ### GPU_dcuda_upload.ps1
 
@@ -65,10 +67,10 @@ nvidia-smi
 
 | 项目 | 参数 |
 |------|------|
-| 管线 | GPU 解码 (CUDA) → CPU 转置 → GPU 缩放 → NVENC 编码 |
-| 分辨率 | 720 × 1280（竖屏） |
+| 管线 | GPU 解码 (CUDA) → **CPU 转置** → GPU 缩放 → NVENC 编码 |
+| 分辨率 | 720p（自动对边） |
 | 帧率 | 30fps |
-| 编码预设 | p5 / VBR HQ / CQ 29 |
+| 编码预设 | p6 / VBR HQ / CQ 29 |
 | 码率上限 | 2.4 Mbps |
 | 音频 | 直接复制 |
 
@@ -76,20 +78,20 @@ nvidia-smi
 .\GPU_dcuda_upload.ps1 -InputFile ".\video.mp4"
 ```
 
-滤镜链：`hwdownload → format=nv12 → transpose=clock → hwupload_cuda → scale_cuda=720:1280`
+滤镜链：`hwdownload → format=nv12 → transpose=clock → hwupload_cuda → scale_cuda=720:-2`
 
-像素被物理旋转为竖屏，兼容性最好，适合上传到不读取旋转元数据的平台。
+需要将帧从 GPU 下载到系统内存（hwdownload），由 CPU 执行 transpose 物理旋转像素，再上传回 GPU（hwupload_cuda）进行缩放和编码。这一来一回的数据搬运增加了 CPU 和内存开销。像素被物理旋转为竖屏，兼容性最好，适合上传到不读取旋转元数据的平台。
 
 ### GPU_dnv12_upload.ps1
 
-与 `GPU_dcuda_upload.ps1` 目的一致（生成竖屏视频），但采用 nv12 输出格式，省去 CPU 中转。
+与 `GPU_dcuda_upload.ps1` 目的一致（物理旋转像素，输出竖屏视频用于上传），但旋转由 FFmpeg 在 nv12 解码时隐式完成。
 
 | 项目 | 参数 |
 |------|------|
-| 管线 | GPU 解码 (nv12) → GPU 缩放 → NVENC 编码 |
-| 分辨率 | 720 × 1280（竖屏） |
+| 管线 | GPU 解码 (nv12, 隐式旋转) → GPU 缩放 → NVENC 编码 |
+| 分辨率 | 720p（自动对边） |
 | 帧率 | 30fps |
-| 编码预设 | p5 / VBR HQ / CQ 29 |
+| 编码预设 | p6 / VBR HQ / CQ 29 |
 | 码率上限 | 2.4 Mbps |
 | 音频 | 直接复制 |
 
@@ -97,36 +99,20 @@ nvidia-smi
 .\GPU_dnv12_upload.ps1 -InputFile ".\video.mp4"
 ```
 
-滤镜链：`hwupload_cuda → scale_cuda=720:1280`
+滤镜链：`hwupload_cuda → scale_cuda=720:-2`
 
-全程 GPU 处理，速度更快，但不会物理旋转像素——如果原始视频是横屏拍摄，输出仍然是横屏画面。适用于素材本身已经是竖屏的情况。
+使用 `hwaccel_output_format nv12` 时，FFmpeg 读取到原视频的旋转矩阵后会在解码阶段隐式执行 transpose，输出的 nv12 帧（存放在系统内存）已经是旋转后的画面。再通过 hwupload_cuda 上传回 GPU 显存进行缩放和编码。隐式旋转同样发生在 CPU 上，因此与 GPU_dcuda_upload.ps1 性能相当，区别仅在于旋转由 FFmpeg 内部完成而非通过显式的 transpose 滤镜。
 
-### script_CPU_GPU.ps1
+## 三个脚本对比
 
-CPU 解码 + GPU 编码的混合管线，同时转码音频。
+| | GPU_dcuda.ps1 | GPU_dcuda_upload.ps1 | GPU_dnv12_upload.ps1 |
+|---|---|---|---|
+| 解码输出格式 | `cuda`（GPU 显存） | `cuda` → hwdownload 到系统内存 | `nv12`（系统内存，隐式旋转） |
+| 旋转方式 | 元数据（ExifTool） | CPU 显式 transpose | FFmpeg 隐式旋转（nv12 解码时） |
+| CPU↔GPU 数据搬运 | **无** | 有 | 有 |
+| CPU 占用 | **最低** | 高 | 高 |
+| 内存占用 | **最低** | 高 | 高 |
+| 编码速度 | **最快** | 较慢 | 较慢 |
+| 适用场景 | 本地归档、支持元数据的平台 | 上传到不读取旋转元数据的平台 | 同左 |
 
-| 项目 | 参数 |
-|------|------|
-| 管线 | CPU 解码 → CPU 缩放 → NVENC 编码 |
-| 分辨率 | 自动宽度 × 1080p |
-| 帧率 | 60fps |
-| 编码预设 | p7 / VBR / CQ 27 |
-| 码率上限 | 2.6 Mbps |
-| 音频 | AAC 96kbps 单声道 |
-
-```powershell
-.\script_CPU_GPU.ps1 -InputFile ".\video.mp4"
-```
-
-适用于需要高质量 60fps 输出、或 GPU 解码不可用的场景。p7 预设编码质量最高但速度较慢。
-
-## GPU_dcuda_upload 与 GPU_dnv12_upload 对比
-
-两个脚本目标相同——生成 720×1280 竖屏 HEVC 视频用于上传，区别在于旋转处理方式：
-
-| | GPU_dcuda_upload | GPU_dnv12_upload |
-|---|---|---|
-| 解码输出格式 | `cuda` | `nv12` |
-| 像素物理旋转 | 有（CPU transpose） | 无 |
-| 性能 | 较慢（需 CPU↔GPU 数据搬运） | 较快（全程 GPU） |
-| 适用场景 | 横屏素材需旋转为竖屏 | 素材本身已为竖屏 |
+**如果目标平台支持旋转元数据，优先使用 `GPU_dcuda.ps1`——全 GPU 管线，不折腾 CPU 和内存。**

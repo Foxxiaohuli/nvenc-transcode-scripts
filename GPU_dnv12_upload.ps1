@@ -18,10 +18,12 @@ $ffmpegArgs = @(
     "-hwaccel", "cuda",
     "-hwaccel_output_format", "nv12",        
     "-i", $InputFile,
-    "-vf", "hwupload_cuda,scale_cuda=720:1280,fps=30",
+    #手机拍摄的竖屏视频存储的时候是横着存的，实际为1920x1080，配合旋转矩阵竖屏播放
+    #这里scale为720:-2,原因是解码时读取了旋转元数据，导致宽高被交换了，所以720是为竖屏的短边宽度
+    "-vf", "hwupload_cuda,scale_cuda=720:-2,fps=30",
     "-c:v", "hevc_nvenc",
     "-profile:v", "main",
-    "-preset", "p5",
+    "-preset", "p6",
     "-rc", "vbr_hq",
     "-cq", "29",
     "-maxrate", "2.4M",
